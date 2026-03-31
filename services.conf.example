@@ -1,0 +1,99 @@
+# ============================================================================
+# services.conf - Service Manager Configuration
+# ============================================================================
+# Copy this file to services.conf and fill in your values.
+# This file is gitignored — do not commit it to the repository.
+# Back up this file separately (password manager, encrypted note, etc).
+# ============================================================================
+
+# ---------- Service Count ----------
+# Total number of services to manage. Each service uses SERVICE_N_* variables.
+SERVICE_COUNT="2"
+
+# ---------- Service 1 ----------
+SERVICE_1_NAME="myapp1"
+SERVICE_1_PATH="/usr/local/bin/myapp1"
+SERVICE_1_ARGS=""
+SERVICE_1_USER="pi"
+SERVICE_1_WORKDIR="/home/pi"
+
+# Optional: command to run before sending SIGTERM on shutdown
+# Example: "/usr/local/bin/myapp1 --flush-db"
+SERVICE_1_PRE_SHUTDOWN=""
+
+# Optional: path to a log file for logrotate (leave empty if using journal only)
+SERVICE_1_LOG_FILE=""
+
+# Optional: memory cap (systemd MemoryMax). Examples: "256M", "512M", "1G"
+SERVICE_1_MEMORY_MAX=""
+
+# Optional: custom health check command. Must exit 0 for healthy, non-zero for unhealthy.
+# Examples:
+#   "curl -sf http://localhost:8080/health"
+#   "test -f /tmp/myapp1.heartbeat -a \$(( \$(date +%s) - \$(stat -c %Y /tmp/myapp1.heartbeat) )) -lt 300"
+#   "pgrep -f 'myapp1 --worker'"
+SERVICE_1_HEALTH_CMD=""
+
+# Optional: name of another managed service this one depends on (must start after)
+SERVICE_1_AFTER=""
+
+# Optional: hours to offset this service's restart from the base cycle.
+# Use to stagger restarts so services don't all go down simultaneously.
+# Service with 0 restarts at exactly RESTART_INTERVAL_DAYS.
+# Service with 24 restarts 24 hours later.
+SERVICE_1_STAGGER_HOURS="0"
+
+# ---------- Service 2 ----------
+SERVICE_2_NAME="myapp2"
+SERVICE_2_PATH="/usr/local/bin/myapp2"
+SERVICE_2_ARGS=""
+SERVICE_2_USER="pi"
+SERVICE_2_WORKDIR="/home/pi"
+SERVICE_2_PRE_SHUTDOWN=""
+SERVICE_2_LOG_FILE=""
+SERVICE_2_MEMORY_MAX=""
+SERVICE_2_HEALTH_CMD=""
+SERVICE_2_AFTER=""
+SERVICE_2_STAGGER_HOURS="24"
+
+# ---------- Timing ----------
+# Base restart interval in days. Each service may add STAGGER_HOURS on top.
+RESTART_INTERVAL_DAYS="3"
+
+# Delay between stop and restart (seconds). 300 = 5 minutes.
+RESTART_DELAY_SECS="300"
+
+# How often the health check runs. Uses systemd time syntax.
+# Examples: "2h", "30min", "1h30min"
+HEALTH_CHECK_INTERVAL="2h"
+
+# ---------- CPU Monitoring ----------
+# CPU usage percentage threshold. If a service exceeds this during a health
+# check, it will be flagged in the memory CSV and logged to the journal.
+# Does not auto-restart — informational only.
+CPU_THRESHOLD="90"
+
+# ---------- Notifications ----------
+# Webhook URL for failure notifications (Slack, Discord, ntfy, etc).
+# Leave empty to log failures to systemd journal only.
+# Slack:   "https://hooks.slack.com/services/T00/B00/xxxxx"
+# Discord: "https://discord.com/api/webhooks/xxxxx"
+# ntfy:    "https://ntfy.sh/your-topic"
+NOTIFY_WEBHOOK_URL=""
+
+# Email address for failure notifications. Requires msmtp or sendmail.
+# Leave empty to disable email notifications.
+NOTIFY_EMAIL=""
+NOTIFY_EMAIL_FROM="svc-manager@raspberrypi"
+
+# ---------- Config Backup ----------
+# Directory to copy services.conf on each install/update. Leave empty to skip.
+# Examples: "/mnt/usb/backups", "/home/pi/config-backups"
+CONFIG_BACKUP_DIR=""
+
+# ---------- Dashboard ----------
+# Port for the JSON status endpoint. Set to 0 to disable.
+# Endpoints:
+#   GET /status  — current service state, memory, CPU, restart countdown
+#   GET /memory  — recent entries from the memory trend CSV
+DASHBOARD_PORT="0"
