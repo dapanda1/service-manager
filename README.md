@@ -24,7 +24,7 @@ Manages Linux services with scheduled restarts, health checks, memory tracking, 
 
 ```bash
 # Clone and configure
-git clone <your-repo-url>
+git clone https://github.com/dapanda1/service-manager
 cd service-manager
 cp services.conf.example services.conf
 nano services.conf
