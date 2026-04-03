@@ -4,22 +4,16 @@ set -euo pipefail
 # ============================================================================
 # Service Manager Setup Script (v2)
 #
-# Features:
-#   - Arbitrary number of managed services
-#   - Scheduled graceful restarts via RuntimeMaxSec
-#   - Staggered restart offsets per service
-#   - Health checks with optional custom commands per service
-#   - Memory trend logging to CSV
-#   - CPU usage monitoring
-#   - Failure notifications (webhook + optional email)
-#   - Log rotation for service log files
-#   - Pre-shutdown commands per service
-#   - Startup ordering dependencies
-#   - Dry run mode
-#   - Update mode with checksum diffing
-#   - Automatic config backup on install
-#   - Lightweight JSON dashboard endpoint
-#   - flock-based overlap prevention
+# Monitor-based approach: programs are started/stopped by the user normally
+# (taskbar, icon, right-click close). A health check runs on a timer to:
+#   - Restart programs that aren't running
+#   - Perform scheduled restarts for memory leak mitigation
+#   - Log memory and CPU trends to CSV
+#   - Flag high CPU usage
+#   - Send notifications on failure
+#
+# No systemd .service units are created for the managed programs.
+# Systemd is only used for the health check timer, dashboard, and notify.
 # ============================================================================
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -51,10 +45,10 @@ usage() {
 Usage: $0 [OPTION]
 
 Options:
-  --install       Install and enable all services (default)
+  --install       Install and enable health check, dashboard, notifications
   --uninstall     Stop, disable, and remove all generated files
-  --update        Regenerate files, only restart services that changed
-  --status        Show service status, memory, and restart countdown
+  --update        Regenerate files, restart only components that changed
+  --status        Show program status, memory, CPU, restart countdown
   --dry-run       Show what --install would do without making changes
   --verbose       With --dry-run, print generated file contents
   --help          Show this help message
@@ -82,16 +76,6 @@ write_file() {
     echo "$content" > "$path"
     chmod "$mode" "$path"
     log_info "Created ${path}"
-}
-
-run_cmd() {
-    local desc="$1"
-    shift
-    if $DRY_RUN; then
-        log_dry "Would run: $*"
-        return
-    fi
-    "$@"
 }
 
 format_duration() {
@@ -136,10 +120,8 @@ validate_config() {
 
     local seen_names=()
     for i in $(seq 1 "$count"); do
-        local name
-        name=$(get_svc_var "$i" "NAME")
-        local path
-        path=$(get_svc_var "$i" "PATH")
+        local name=$(get_svc_var "$i" "NAME")
+        local path=$(get_svc_var "$i" "PATH")
 
         if [[ -z "$name" ]]; then
             log_error "SERVICE_${i}_NAME is required."
@@ -163,22 +145,6 @@ validate_config() {
                 log_warn "SERVICE_${i}_PATH does not exist yet: ${path}"
             elif [[ ! -x "$path" ]]; then
                 log_warn "SERVICE_${i}_PATH is not executable: ${path}"
-            fi
-        fi
-
-        local after
-        after=$(get_svc_var "$i" "AFTER")
-        if [[ -n "$after" ]]; then
-            local dep_found=false
-            for j in $(seq 1 "$count"); do
-                if [[ "$(get_svc_var "$j" "NAME")" == "$after" ]]; then
-                    dep_found=true
-                    break
-                fi
-            done
-            if ! $dep_found; then
-                log_error "SERVICE_${i}_AFTER references unknown service: ${after}"
-                errors=1
             fi
         fi
     done
@@ -227,93 +193,50 @@ declare -A NEW_CHECKSUMS
 
 # ---------- Generators ----------
 
-generate_service_unit() {
-    local index="$1"
-    local name=$(get_svc_var "$index" "NAME")
-    local path=$(get_svc_var "$index" "PATH")
-    local args=$(get_svc_var "$index" "ARGS")
-    local user=$(get_svc_var "$index" "USER" "root")
-    local workdir=$(get_svc_var "$index" "WORKDIR" "/")
-    local pre_shutdown=$(get_svc_var "$index" "PRE_SHUTDOWN")
-    local memory_max=$(get_svc_var "$index" "MEMORY_MAX")
-    local after=$(get_svc_var "$index" "AFTER")
-    local stagger_hours=$(get_svc_var "$index" "STAGGER_HOURS" "0")
-
-    local base_secs=$(( RESTART_INTERVAL_DAYS * 86400 ))
-    local offset_secs=$(( stagger_hours * 3600 ))
-    local runtime_max=$(( base_secs + offset_secs ))
-    local unit_file="${SYSTEMD_DIR}/${name}.service"
-
-    local content="[Unit]
-Description=Managed service: ${name}"
-
-    if [[ -n "$after" ]]; then
-        content+="
-After=network.target ${after}.service
-Requires=${after}.service"
-    else
-        content+="
-After=network.target"
-    fi
-
-    content+="
-OnFailure=svc-manager-notify@%n.service
-
-[Service]
-Type=simple
-User=${user}
-WorkingDirectory=${workdir}
-ExecStart=${path}${args:+ ${args}}"
-
-    if [[ -n "$pre_shutdown" ]]; then
-        content+="
-ExecStop=/bin/bash -c '${pre_shutdown}; kill -TERM \$MAINPID'"
-    fi
-
-    content+="
-Restart=always
-RestartSec=${RESTART_DELAY_SECS}
-RuntimeMaxSec=${runtime_max}
-TimeoutStopSec=30
-KillMode=mixed
-KillSignal=SIGTERM"
-
-    if [[ -n "$memory_max" ]]; then
-        content+="
-MemoryMax=${memory_max}"
-    fi
-
-    content+="
-
-[Install]
-WantedBy=multi-user.target"
-
-    NEW_CHECKSUMS["$name"]=$(compute_checksum "$content")
-    write_file "$unit_file" "$content"
-}
-
 generate_health_check_script() {
     local count="${SERVICE_COUNT}"
     local script_path="${BIN_DIR}/svc-manager-health-check.sh"
+    local restart_interval_secs=$(( RESTART_INTERVAL_DAYS * 86400 ))
 
-    local names_arr=""
-    local health_cmds_arr=""
+    # Build config arrays for the health check script
+    local names_arr="" paths_arr="" args_arr="" users_arr=""
+    local env_arr="" pgrep_arr="" health_cmds_arr=""
+    local pre_shutdown_arr="" stagger_arr="" memory_max_arr=""
+
     for i in $(seq 1 "$count"); do
-        local name=$(get_svc_var "$i" "NAME")
-        local hcmd=$(get_svc_var "$i" "HEALTH_CMD")
-        names_arr+="\"${name}\" "
-        health_cmds_arr+="\"${hcmd}\" "
+        names_arr+="\"$(get_svc_var "$i" "NAME")\" "
+        paths_arr+="\"$(get_svc_var "$i" "PATH")\" "
+        args_arr+="\"$(get_svc_var "$i" "ARGS")\" "
+        users_arr+="\"$(get_svc_var "$i" "USER" "root")\" "
+        env_arr+="\"$(get_svc_var "$i" "ENV")\" "
+        pgrep_arr+="\"$(get_svc_var "$i" "PGREP" "$(basename "$(get_svc_var "$i" "PATH")")")\" "
+        health_cmds_arr+="\"$(get_svc_var "$i" "HEALTH_CMD")\" "
+        pre_shutdown_arr+="\"$(get_svc_var "$i" "PRE_SHUTDOWN")\" "
+        stagger_arr+="\"$(get_svc_var "$i" "STAGGER_HOURS" "0")\" "
+        memory_max_arr+="\"$(get_svc_var "$i" "MEMORY_MAX")\" "
     done
 
     local content='#!/bin/bash
 set -euo pipefail
 
 LOCK_FILE="/tmp/svc-manager-health-check.lock"
+DATA_DIR="'"${DATA_DIR}"'"
 MEMORY_CSV="'"${MEMORY_CSV}"'"
 CPU_THRESHOLD="'"${CPU_THRESHOLD}"'"
+RESTART_INTERVAL_SECS="'"${restart_interval_secs}"'"
+RESTART_DELAY_SECS="'"${RESTART_DELAY_SECS}"'"
+NOTIFY_SCRIPT="'"${BIN_DIR}/svc-manager-notify-failure.sh"'"
 
-SERVICES=('"${names_arr}"')
+NAMES=('"${names_arr}"')
+PATHS=('"${paths_arr}"')
+ARGS=('"${args_arr}"')
+USERS=('"${users_arr}"')
+ENVS=('"${env_arr}"')
+PGREPS=('"${pgrep_arr}"')
 HEALTH_CMDS=('"${health_cmds_arr}"')
+PRE_SHUTDOWNS=('"${pre_shutdown_arr}"')
+STAGGERS=('"${stagger_arr}"')
+MEMORY_MAXES=('"${memory_max_arr}"')
 
 exec 200>"$LOCK_FILE"
 if ! flock -n 200; then
@@ -321,66 +244,272 @@ if ! flock -n 200; then
     exit 0
 fi
 
-mkdir -p "$(dirname "$MEMORY_CSV")"
+mkdir -p "$DATA_DIR" "$(dirname "$MEMORY_CSV")"
 
 if [[ ! -f "$MEMORY_CSV" ]]; then
     echo "timestamp,service,pid,rss_kb,cpu_pct,status" > "$MEMORY_CSV"
 fi
 
 TS="$(date '"'"'+%Y-%m-%d %H:%M:%S'"'"')"
+NOW=$(date +%s)
 
-for idx in "${!SERVICES[@]}"; do
-    svc="${SERVICES[$idx]}"
+is_running() {
+    local pattern="$1"
+    local user="$2"
+    pgrep -u "$user" -f "$pattern" >/dev/null 2>&1
+}
+
+get_pid() {
+    local pattern="$1"
+    local user="$2"
+    pgrep -u "$user" -f "$pattern" -n 2>/dev/null || echo "0"
+}
+
+start_program() {
+    local idx="$1"
+    local path="${PATHS[$idx]}"
+    local args="${ARGS[$idx]}"
+    local user="${USERS[$idx]}"
+    local env="${ENVS[$idx]}"
+    local name="${NAMES[$idx]}"
+
+    # Build environment exports
+    local env_exports=""
+    if [[ -n "$env" ]]; then
+        IFS='"'"';'"'"' read -ra envs <<< "$env"
+        for ev in "${envs[@]}"; do
+            ev=$(echo "$ev" | xargs)
+            if [[ -n "$ev" ]]; then
+                env_exports+="export ${ev}; "
+            fi
+        done
+    fi
+
+    echo "${TS} Starting ${name} as ${user}..."
+    sudo -u "$user" bash -c "${env_exports}nohup ${path}${args:+ ${args}} >/dev/null 2>&1 &"
+
+    # Wait briefly and verify it started
+    sleep 3
+    if is_running "${path}" "$user"; then
+        echo "${TS} ${name} started successfully."
+        return 0
+    else
+        echo "${TS} ${name} failed to start."
+        if [[ -x "$NOTIFY_SCRIPT" ]]; then
+            "$NOTIFY_SCRIPT" "${name}" 2>/dev/null || true
+        fi
+        return 1
+    fi
+}
+
+stop_program() {
+    local idx="$1"
+    local path="${PATHS[$idx]}"
+    local user="${USERS[$idx]}"
+    local name="${NAMES[$idx]}"
+    local pre_shutdown="${PRE_SHUTDOWNS[$idx]}"
+    local pid
+
+    pid=$(get_pid "$path" "$user")
+    if [[ "$pid" -eq 0 ]]; then
+        return 0
+    fi
+
+    echo "${TS} Stopping ${name} (PID ${pid})..."
+
+    # Run pre-shutdown command if configured
+    if [[ -n "$pre_shutdown" ]]; then
+        echo "${TS} Running pre-shutdown for ${name}..."
+        sudo -u "$user" bash -c "$pre_shutdown" 2>/dev/null || true
+    fi
+
+    # Graceful shutdown
+    kill -TERM "$pid" 2>/dev/null || true
+
+    # Wait up to 30 seconds for clean exit
+    local waited=0
+    while [[ $waited -lt 30 ]]; do
+        if ! kill -0 "$pid" 2>/dev/null; then
+            echo "${TS} ${name} stopped cleanly."
+            return 0
+        fi
+        sleep 1
+        waited=$(( waited + 1 ))
+    done
+
+    # Force kill
+    echo "${TS} ${name} did not stop in 30s, sending SIGKILL..."
+    kill -KILL "$pid" 2>/dev/null || true
+    sleep 1
+}
+
+get_last_restart() {
+    local name="$1"
+    local file="${DATA_DIR}/${name}.last_restart"
+    if [[ -f "$file" ]]; then
+        cat "$file"
+    else
+        echo "0"
+    fi
+}
+
+set_last_restart() {
+    local name="$1"
+    local ts="$2"
+    echo "$ts" > "${DATA_DIR}/${name}.last_restart"
+}
+
+# Convert memory max string (e.g., "256M", "1G") to KB
+parse_memory_max_kb() {
+    local val="$1"
+    if [[ -z "$val" ]]; then
+        echo "0"
+        return
+    fi
+    local num="${val%[A-Za-z]*}"
+    local unit="${val##*[0-9]}"
+    case "${unit^^}" in
+        K) echo "$num" ;;
+        M) echo $(( num * 1024 )) ;;
+        G) echo $(( num * 1024 * 1024 )) ;;
+        *) echo "0" ;;
+    esac
+}
+
+# ---------- Main loop ----------
+
+for idx in "${!NAMES[@]}"; do
+    name="${NAMES[$idx]}"
+    path="${PATHS[$idx]}"
+    user="${USERS[$idx]}"
     hcmd="${HEALTH_CMDS[$idx]}"
+    stagger="${STAGGERS[$idx]}"
+    mem_max="${MEMORY_MAXES[$idx]}"
+
     pid="0"
     rss="0"
     cpu="0.0"
     status="unknown"
 
-    if systemctl is-active --quiet "$svc"; then
-        pid=$(systemctl show -p MainPID --value "$svc" 2>/dev/null || echo "0")
+    stagger_secs=$(( stagger * 3600 ))
+    effective_interval=$(( RESTART_INTERVAL_SECS + stagger_secs ))
 
+    running=false
+    if is_running "$path" "$user"; then
+        running=true
+        pid=$(get_pid "$path" "$user")
+    fi
+
+    if $running; then
+        # Gather metrics
         if [[ "$pid" -gt 0 ]] && [[ -d "/proc/${pid}" ]]; then
             rss=$(awk '"'"'/VmRSS/ {print $2}'"'"' "/proc/${pid}/status" 2>/dev/null || echo "0")
             cpu=$(ps -o %cpu= -p "$pid" 2>/dev/null | tr -d '"'"' '"'"' || echo "0.0")
         fi
 
-        # Custom health check
-        if [[ -n "$hcmd" ]]; then
-            if eval "$hcmd" >/dev/null 2>&1; then
-                status="healthy"
-            else
-                status="unhealthy"
-                echo "${TS} ${svc} health command failed. Restarting..."
-                systemctl restart "$svc"
-                status="restarted_health_fail"
-            fi
+        status="running"
+
+        # Check if scheduled restart is due
+        last_restart=$(get_last_restart "$name")
+        if [[ "$last_restart" -eq 0 ]]; then
+            # First run — record current time as baseline, no restart yet
+            set_last_restart "$name" "$NOW"
         else
-            status="running"
+            elapsed=$(( NOW - last_restart ))
+            if [[ "$elapsed" -ge "$effective_interval" ]]; then
+                echo "${TS} ${name} scheduled restart (${elapsed}s since last restart, interval ${effective_interval}s)."
+                stop_program "$idx"
+                status="scheduled_restart"
+
+                echo "${TS} Waiting ${RESTART_DELAY_SECS}s before restarting ${name}..."
+                sleep "$RESTART_DELAY_SECS"
+
+                if start_program "$idx"; then
+                    set_last_restart "$name" "$(date +%s)"
+                    status="restarted_scheduled"
+                    pid=$(get_pid "$path" "$user")
+                    if [[ "$pid" -gt 0 ]] && [[ -d "/proc/${pid}" ]]; then
+                        rss=$(awk '"'"'/VmRSS/ {print $2}'"'"' "/proc/${pid}/status" 2>/dev/null || echo "0")
+                        cpu=$(ps -o %cpu= -p "$pid" 2>/dev/null | tr -d '"'"' '"'"' || echo "0.0")
+                    fi
+                else
+                    status="restart_failed"
+                fi
+
+                # Skip further checks after a scheduled restart
+                echo "${TS},${name},${pid},${rss},${cpu},${status}" >> "$MEMORY_CSV"
+                echo "${TS} ${name}: pid=${pid} rss=${rss}KB cpu=${cpu}% status=${status}"
+                continue
+            fi
         fi
 
-        # CPU threshold check
+        # Memory cap check
+        if [[ -n "$mem_max" ]]; then
+            max_kb=$(parse_memory_max_kb "$mem_max")
+            if [[ "$max_kb" -gt 0 ]] && [[ "$rss" -gt "$max_kb" ]]; then
+                echo "${TS} ${name} memory ${rss}KB exceeds cap ${max_kb}KB. Restarting..."
+                stop_program "$idx"
+                sleep "$RESTART_DELAY_SECS"
+                if start_program "$idx"; then
+                    set_last_restart "$name" "$(date +%s)"
+                    status="restarted_memory_cap"
+                else
+                    status="restart_failed"
+                fi
+                pid=$(get_pid "$path" "$user")
+                echo "${TS},${name},${pid},${rss},${cpu},${status}" >> "$MEMORY_CSV"
+                echo "${TS} ${name}: pid=${pid} rss=${rss}KB cpu=${cpu}% status=${status}"
+                continue
+            fi
+        fi
+
+        # Custom health check
+        if [[ -n "$hcmd" ]]; then
+            if sudo -u "$user" bash -c "$hcmd" >/dev/null 2>&1; then
+                status="healthy"
+            else
+                echo "${TS} ${name} health command failed. Restarting..."
+                stop_program "$idx"
+                sleep 5
+                if start_program "$idx"; then
+                    set_last_restart "$name" "$(date +%s)"
+                    status="restarted_health_fail"
+                else
+                    status="restart_failed"
+                fi
+                pid=$(get_pid "$path" "$user")
+                echo "${TS},${name},${pid},${rss},${cpu},${status}" >> "$MEMORY_CSV"
+                echo "${TS} ${name}: pid=${pid} rss=${rss}KB cpu=${cpu}% status=${status}"
+                continue
+            fi
+        fi
+
+        # CPU threshold check (informational only)
         cpu_int=${cpu%%.*}
         if [[ "${cpu_int:-0}" -ge "$CPU_THRESHOLD" ]]; then
-            echo "${TS} ${svc} CPU at ${cpu}% (threshold: ${CPU_THRESHOLD}%). Flagging."
+            echo "${TS} ${name} CPU at ${cpu}% (threshold: ${CPU_THRESHOLD}%)."
             status="high_cpu"
-            logger -t svc-manager "${svc} CPU usage at ${cpu}% exceeds threshold ${CPU_THRESHOLD}%"
+            logger -t svc-manager "${name} CPU at ${cpu}% exceeds threshold ${CPU_THRESHOLD}%"
         fi
+
     else
-        status="down"
-        echo "${TS} ${svc} is not running. Restarting..."
-        systemctl restart "$svc"
-        if systemctl is-active --quiet "$svc"; then
-            echo "${TS} ${svc} restarted successfully."
-            status="restarted"
+        # Not running — start it
+        echo "${TS} ${name} is not running."
+        if start_program "$idx"; then
+            # Only reset the restart timer if there was no previous baseline
+            last_restart=$(get_last_restart "$name")
+            if [[ "$last_restart" -eq 0 ]]; then
+                set_last_restart "$name" "$(date +%s)"
+            fi
+            pid=$(get_pid "$path" "$user")
+            status="started"
         else
-            echo "${TS} ${svc} failed to restart."
-            status="restart_failed"
+            status="start_failed"
         fi
     fi
 
-    echo "${TS},${svc},${pid},${rss},${cpu},${status}" >> "$MEMORY_CSV"
-    echo "${TS} ${svc}: pid=${pid} rss=${rss}KB cpu=${cpu}% status=${status}"
+    echo "${TS},${name},${pid},${rss},${cpu},${status}" >> "$MEMORY_CSV"
+    echo "${TS} ${name}: pid=${pid} rss=${rss}KB cpu=${cpu}% status=${status}"
 done'
 
     NEW_CHECKSUMS["health-check"]=$(compute_checksum "$content")
@@ -392,17 +521,17 @@ generate_health_check_units() {
     local timer_file="${SYSTEMD_DIR}/svc-manager-health-check.timer"
 
     local svc_content="[Unit]
-Description=Health check for managed services
+Description=Health check for managed programs
 
 [Service]
 Type=oneshot
 ExecStart=${BIN_DIR}/svc-manager-health-check.sh"
 
     local timer_content="[Unit]
-Description=Health check timer for managed services
+Description=Health check timer for managed programs
 
 [Timer]
-OnBootSec=5min
+OnBootSec=2min
 OnUnitActiveSec=${HEALTH_CHECK_INTERVAL}
 Persistent=true
 
@@ -421,10 +550,10 @@ generate_notify_script() {
     local content='#!/bin/bash
 set -euo pipefail
 
-FAILED_UNIT="${1:-unknown}"
+FAILED="${1:-unknown}"
 TIMESTAMP="$(date '"'"'+%Y-%m-%d %H:%M:%S'"'"')"
 HOSTNAME="$(hostname)"
-MESSAGE="[svc-manager] ${FAILED_UNIT} failed on ${HOSTNAME} at ${TIMESTAMP}"
+MESSAGE="[svc-manager] ${FAILED} failed on ${HOSTNAME} at ${TIMESTAMP}"
 
 logger -t svc-manager "${MESSAGE}"
 
@@ -455,20 +584,6 @@ fi'
 
     NEW_CHECKSUMS["notify"]=$(compute_checksum "$content")
     write_file "$script_path" "$content" "755"
-}
-
-generate_notify_unit() {
-    local unit_file="${SYSTEMD_DIR}/svc-manager-notify@.service"
-
-    local content="[Unit]
-Description=Failure notification for %i
-
-[Service]
-Type=oneshot
-ExecStart=${BIN_DIR}/svc-manager-notify-failure.sh %i"
-
-    NEW_CHECKSUMS["notify-unit"]=$(compute_checksum "$content")
-    write_file "$unit_file" "$content"
 }
 
 generate_logrotate() {
@@ -513,24 +628,27 @@ generate_dashboard() {
     local script_path="${BIN_DIR}/svc-manager-dashboard.py"
     local unit_file="${SYSTEMD_DIR}/svc-manager-dashboard.service"
 
-    local py_names="["
-    for i in $(seq 1 "$SERVICE_COUNT"); do
-        local name=$(get_svc_var "$i" "NAME")
-        if [[ "$i" -gt 1 ]]; then py_names+=", "; fi
-        py_names+="\"${name}\""
-    done
-    py_names+="]"
-
     local restart_base_secs=$(( RESTART_INTERVAL_DAYS * 86400 ))
 
-    local py_staggers="{"
+    # Build Python lists/dicts from config
+    local py_names="[" py_paths="[" py_users="[" py_pgreps="[" py_staggers="{"
     for i in $(seq 1 "$SERVICE_COUNT"); do
         local name=$(get_svc_var "$i" "NAME")
+        local path=$(get_svc_var "$i" "PATH")
+        local user=$(get_svc_var "$i" "USER" "root")
+        local pgrep_pat=$(get_svc_var "$i" "PGREP" "$(basename "$path")")
         local stagger=$(get_svc_var "$i" "STAGGER_HOURS" "0")
-        if [[ "$i" -gt 1 ]]; then py_staggers+=", "; fi
+        if [[ "$i" -gt 1 ]]; then
+            py_names+=", "; py_paths+=", "; py_users+=", "; py_pgreps+=", "
+            py_staggers+=", "
+        fi
+        py_names+="\"${name}\""
+        py_paths+="\"${path}\""
+        py_users+="\"${user}\""
+        py_pgreps+="\"${pgrep_pat}\""
         py_staggers+="\"${name}\": ${stagger}"
     done
-    py_staggers+="}"
+    py_names+="]"; py_paths+="]"; py_users+="]"; py_pgreps+="]"; py_staggers+="}"
 
     local py_content="#!/usr/bin/env python3
 \"\"\"Lightweight JSON status dashboard for svc-manager.\"\"\"
@@ -544,69 +662,70 @@ from datetime import datetime
 
 PORT = ${port}
 SERVICES = ${py_names}
+PATHS = ${py_paths}
+USERS = ${py_users}
+PGREPS = ${py_pgreps}
 RESTART_BASE_SECS = ${restart_base_secs}
 STAGGER_HOURS = ${py_staggers}
+DATA_DIR = \"${DATA_DIR}\"
 MEMORY_CSV = \"${MEMORY_CSV}\"
 
 
-def get_service_info(name):
+def get_service_info(idx):
+    name = SERVICES[idx]
+    path = PATHS[idx]
+    user = USERS[idx]
+    pgrep_pat = PGREPS[idx]
+
     info = {
-        \"name\": name, \"state\": \"unknown\", \"pid\": 0,
+        \"name\": name, \"state\": \"stopped\", \"pid\": 0,
         \"rss_kb\": 0, \"cpu_pct\": 0.0, \"uptime_secs\": 0,
         \"restart_in_secs\": 0
     }
 
     try:
-        r = subprocess.run([\"systemctl\", \"is-active\", name],
+        r = subprocess.run([\"pgrep\", \"-u\", user, \"-f\", pgrep_pat, \"-n\"],
                            capture_output=True, text=True, timeout=5)
-        info[\"state\"] = r.stdout.strip()
+        pid = int(r.stdout.strip()) if r.returncode == 0 else 0
     except Exception:
+        pid = 0
+
+    if pid == 0:
         return info
 
-    if info[\"state\"] != \"active\":
-        return info
+    info[\"state\"] = \"running\"
+    info[\"pid\"] = pid
 
     try:
-        r = subprocess.run([\"systemctl\", \"show\", \"-p\", \"MainPID\", \"--value\", name],
-                           capture_output=True, text=True, timeout=5)
-        pid = int(r.stdout.strip())
-        info[\"pid\"] = pid
-
-        if pid > 0 and os.path.isfile(f\"/proc/{pid}/status\"):
+        if os.path.isfile(f\"/proc/{pid}/status\"):
             with open(f\"/proc/{pid}/status\") as f:
                 for line in f:
                     if line.startswith(\"VmRSS:\"):
                         info[\"rss_kb\"] = int(line.split()[1])
                         break
-
-            r = subprocess.run([\"ps\", \"-o\", \"%cpu=\", \"-p\", str(pid)],
-                               capture_output=True, text=True, timeout=5)
-            info[\"cpu_pct\"] = float(r.stdout.strip() or \"0\")
+        r = subprocess.run([\"ps\", \"-o\", \"%cpu=\", \"-p\", str(pid)],
+                           capture_output=True, text=True, timeout=5)
+        info[\"cpu_pct\"] = float(r.stdout.strip() or \"0\")
     except Exception:
         pass
 
+    # Uptime from /proc/pid
     try:
-        r = subprocess.run([\"systemctl\", \"show\", \"-p\", \"ActiveEnterTimestamp\",
-                            \"--value\", name],
-                           capture_output=True, text=True, timeout=5)
-        ts_str = r.stdout.strip()
-        if ts_str:
-            # Parse systemd timestamp format
-            for fmt in (\"%a %Y-%m-%d %H:%M:%S %Z\", \"%Y-%m-%d %H:%M:%S %Z\"):
-                try:
-                    start = datetime.strptime(ts_str, fmt)
-                    break
-                except ValueError:
-                    continue
-            else:
-                start = None
+        stat_start = os.stat(f\"/proc/{pid}\").st_mtime
+        info[\"uptime_secs\"] = int(time.time() - stat_start)
+    except Exception:
+        pass
 
-            if start:
-                uptime = int(time.time() - start.timestamp())
-                info[\"uptime_secs\"] = uptime
-                stagger_secs = STAGGER_HOURS.get(name, 0) * 3600
-                runtime_max = RESTART_BASE_SECS + stagger_secs
-                info[\"restart_in_secs\"] = max(0, runtime_max - uptime)
+    # Next restart countdown
+    try:
+        lr_file = os.path.join(DATA_DIR, f\"{name}.last_restart\")
+        if os.path.isfile(lr_file):
+            with open(lr_file) as f:
+                last_restart = int(f.read().strip())
+            stagger_secs = STAGGER_HOURS.get(name, 0) * 3600
+            effective = RESTART_BASE_SECS + stagger_secs
+            remaining = effective - (int(time.time()) - last_restart)
+            info[\"restart_in_secs\"] = max(0, remaining)
     except Exception:
         pass
 
@@ -639,7 +758,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if self.path in (\"/\", \"/status\"):
             data = {
                 \"timestamp\": datetime.now().isoformat(),
-                \"services\": [get_service_info(s) for s in SERVICES],
+                \"services\": [get_service_info(i) for i in range(len(SERVICES))],
             }
             self._json_response(data)
         elif self.path == \"/memory\":
@@ -724,18 +843,12 @@ do_install() {
 
     backup_config
 
-    log_info "Generating service units..."
-    for i in $(seq 1 "$SERVICE_COUNT"); do
-        generate_service_unit "$i"
-    done
-
     log_info "Generating health check..."
     generate_health_check_script
     generate_health_check_units
 
     log_info "Generating failure notification..."
     generate_notify_script
-    generate_notify_unit
 
     log_info "Generating log rotation configs..."
     for i in $(seq 1 "$SERVICE_COUNT"); do
@@ -759,14 +872,11 @@ do_install() {
     log_info "Reloading systemd..."
     systemctl daemon-reload
 
-    log_info "Enabling and starting services..."
-    for i in $(seq 1 "$SERVICE_COUNT"); do
-        local name=$(get_svc_var "$i" "NAME")
-        systemctl enable --now "${name}.service"
-    done
+    log_info "Enabling health check timer..."
     systemctl enable --now svc-manager-health-check.timer
 
     if [[ "${DASHBOARD_PORT:-0}" -gt 0 ]]; then
+        log_info "Enabling dashboard..."
         systemctl enable --now svc-manager-dashboard.service
     fi
 
@@ -775,10 +885,9 @@ do_install() {
     echo ""
     local svc_list=""
     for i in $(seq 1 "$SERVICE_COUNT"); do
-        local n=$(get_svc_var "$i" "NAME")
-        svc_list+="${n} "
+        svc_list+="$(get_svc_var "$i" "NAME") "
     done
-    log_info "Services:        ${svc_list}"
+    log_info "Monitored:       ${svc_list}"
     log_info "Restart cycle:   every ${RESTART_INTERVAL_DAYS} day(s), ${RESTART_DELAY_SECS}s delay"
     log_info "Health check:    every ${HEALTH_CHECK_INTERVAL}"
     log_info "Memory log:      ${MEMORY_CSV}"
@@ -792,6 +901,9 @@ do_install() {
     if [[ "${DASHBOARD_PORT:-0}" -gt 0 ]]; then
         log_info "Dashboard:       http://$(hostname -I | awk '{print $1}'):${DASHBOARD_PORT}/status"
     fi
+    echo ""
+    log_info "Programs are NOT managed by systemd. Start/stop them normally."
+    log_info "The health check will restart them if they are down."
 }
 
 # ---------- Update ----------
@@ -812,13 +924,9 @@ do_update() {
 
     log_info "Regenerating files and diffing checksums..."
 
-    for i in $(seq 1 "$SERVICE_COUNT"); do
-        generate_service_unit "$i"
-    done
     generate_health_check_script
     generate_health_check_units
     generate_notify_script
-    generate_notify_unit
     for i in $(seq 1 "$SERVICE_COUNT"); do
         local name=$(get_svc_var "$i" "NAME")
         local log_file=$(get_svc_var "$i" "LOG_FILE")
@@ -831,30 +939,18 @@ do_update() {
 
     systemctl daemon-reload
 
-    local restarted=0
-    for i in $(seq 1 "$SERVICE_COUNT"); do
-        local name=$(get_svc_var "$i" "NAME")
-        local old="${SAVED_CHECKSUMS[$name]:-}"
-        local new="${NEW_CHECKSUMS[$name]:-}"
-
-        if [[ "$old" != "$new" ]]; then
-            log_info "${name}: unit changed, restarting..."
-            systemctl enable --now "${name}.service"
-            systemctl restart "${name}.service"
-            restarted=$(( restarted + 1 ))
-        else
-            log_info "${name}: unchanged, skipping restart."
-        fi
-    done
-
+    # Restart timer if changed
     local hc_old="${SAVED_CHECKSUMS[health-check-timer]:-}"
     local hc_new="${NEW_CHECKSUMS[health-check-timer]:-}"
     if [[ "$hc_old" != "$hc_new" ]]; then
         log_info "Health check timer changed, restarting..."
         systemctl enable --now svc-manager-health-check.timer
         systemctl restart svc-manager-health-check.timer
+    else
+        log_info "Health check timer unchanged."
     fi
 
+    # Restart dashboard if changed
     if [[ "${DASHBOARD_PORT:-0}" -gt 0 ]]; then
         local db_old="${SAVED_CHECKSUMS[dashboard]:-}"
         local db_new="${NEW_CHECKSUMS[dashboard]:-}"
@@ -862,11 +958,14 @@ do_update() {
             log_info "Dashboard changed, restarting..."
             systemctl enable --now svc-manager-dashboard.service
             systemctl restart svc-manager-dashboard.service
+        else
+            log_info "Dashboard unchanged."
         fi
     fi
 
     echo ""
-    log_info "Update complete. ${restarted} service(s) restarted."
+    log_info "Update complete. Programs were not restarted."
+    log_info "Changes take effect at the next health check."
 }
 
 # ---------- Uninstall ----------
@@ -880,24 +979,15 @@ do_uninstall() {
     load_config
     validate_config
 
-    echo -e "${YELLOW}This will stop and remove all managed services and generated files.${NC}"
+    echo -e "${YELLOW}This will remove the health check, dashboard, and all generated files.${NC}"
+    echo -e "${YELLOW}Running programs will NOT be stopped.${NC}"
     read -r -p "Continue? [y/N] " confirm
     if [[ "${confirm,,}" != "y" ]]; then
         echo "Aborted."
         exit 0
     fi
 
-    log_info "Stopping and disabling services..."
-
-    for i in $(seq 1 "$SERVICE_COUNT"); do
-        local name=$(get_svc_var "$i" "NAME")
-        if systemctl is-active --quiet "${name}.service" 2>/dev/null; then
-            systemctl stop "${name}.service"
-        fi
-        if systemctl is-enabled --quiet "${name}.service" 2>/dev/null; then
-            systemctl disable "${name}.service"
-        fi
-    done
+    log_info "Stopping and disabling systemd units..."
 
     for unit in \
         "svc-manager-health-check.timer" \
@@ -913,17 +1003,9 @@ do_uninstall() {
 
     log_info "Removing generated files..."
 
-    for i in $(seq 1 "$SERVICE_COUNT"); do
-        local name=$(get_svc_var "$i" "NAME")
-        for f in "${SYSTEMD_DIR}/${name}.service" "${LOGROTATE_DIR}/svc-manager-${name}"; do
-            if [[ -f "$f" ]]; then rm -f "$f"; log_info "Removed ${f}"; fi
-        done
-    done
-
-    local infra_files=(
+    local files=(
         "${SYSTEMD_DIR}/svc-manager-health-check.service"
         "${SYSTEMD_DIR}/svc-manager-health-check.timer"
-        "${SYSTEMD_DIR}/svc-manager-notify@.service"
         "${SYSTEMD_DIR}/svc-manager-dashboard.service"
         "${BIN_DIR}/svc-manager-health-check.sh"
         "${BIN_DIR}/svc-manager-notify-failure.sh"
@@ -931,88 +1013,95 @@ do_uninstall() {
         "${LOGROTATE_DIR}/svc-manager-memory-csv"
     )
 
-    for f in "${infra_files[@]}"; do
+    for i in $(seq 1 "$SERVICE_COUNT"); do
+        local name=$(get_svc_var "$i" "NAME")
+        files+=("${LOGROTATE_DIR}/svc-manager-${name}")
+    done
+
+    for f in "${files[@]}"; do
         if [[ -f "$f" ]]; then rm -f "$f"; log_info "Removed ${f}"; fi
     done
 
     systemctl daemon-reload
 
     echo ""
-    log_info "Uninstall complete."
+    log_info "Uninstall complete. Running programs were not touched."
     log_info "Preserved: ${CONFIG_FILE}"
     log_info "Preserved: ${LOG_DIR}/ (memory history)"
-    log_info "Preserved: ${DATA_DIR}/ (checksums)"
+    log_info "Preserved: ${DATA_DIR}/ (restart timestamps)"
     echo -e "${YELLOW}To remove all data: sudo rm -rf ${LOG_DIR} ${DATA_DIR}${NC}"
 }
 
 # ---------- Status ----------
 
-print_service_status() {
-    local index="$1"
-    local name=$(get_svc_var "$index" "NAME")
-    local stagger=$(get_svc_var "$index" "STAGGER_HOURS" "0")
-    local base_secs=$(( RESTART_INTERVAL_DAYS * 86400 ))
-    local offset_secs=$(( stagger * 3600 ))
-    local runtime_max=$(( base_secs + offset_secs ))
-
-    echo -e "${CYAN}── ${name} ──${NC}"
-
-    local state
-    state=$(systemctl is-active "$name" 2>/dev/null || true)
-
-    if [[ "$state" == "active" ]]; then
-        echo -e "  State:          ${GREEN}${state}${NC}"
-    elif [[ "$state" == "failed" ]]; then
-        echo -e "  State:          ${RED}${state}${NC}"
-    else
-        echo -e "  State:          ${YELLOW}${state}${NC}"
-    fi
-
-    local pid
-    pid=$(systemctl show -p MainPID --value "$name" 2>/dev/null || echo "0")
-    if [[ "$pid" -gt 0 ]] && [[ -f "/proc/${pid}/status" ]]; then
-        local rss_kb
-        rss_kb=$(awk '/VmRSS/ {print $2}' "/proc/${pid}/status" 2>/dev/null || echo "0")
-        local rss_mb=$(( rss_kb / 1024 ))
-        echo "  PID:            ${pid}"
-        echo "  Memory (RSS):   ${rss_mb} MB (${rss_kb} KB)"
-
-        local cpu
-        cpu=$(ps -o %cpu= -p "$pid" 2>/dev/null | tr -d ' ' || echo "0.0")
-        echo "  CPU:            ${cpu}%"
-    else
-        echo "  Memory (RSS):   n/a"
-        echo "  CPU:            n/a"
-    fi
-
-    if [[ "$state" == "active" ]]; then
-        local start_str
-        start_str=$(systemctl show -p ActiveEnterTimestamp --value "$name" 2>/dev/null || echo "")
-        if [[ -n "$start_str" ]]; then
-            local start_ts
-            start_ts=$(date -d "$start_str" +%s 2>/dev/null || echo "0")
-            local now_ts
-            now_ts=$(date +%s)
-            local uptime_secs=$(( now_ts - start_ts ))
-            local remaining=$(( runtime_max - uptime_secs ))
-            echo "  Uptime:         $(format_duration $uptime_secs)"
-            echo "  Next restart:   $(format_duration $remaining)"
-            if [[ "$stagger" -gt 0 ]]; then
-                echo "  Stagger:        +${stagger}h offset"
-            fi
-        fi
-    fi
-
-    echo ""
-}
-
 do_status() {
     load_config
     validate_config
 
+    local restart_base_secs=$(( RESTART_INTERVAL_DAYS * 86400 ))
+
     echo ""
     for i in $(seq 1 "$SERVICE_COUNT"); do
-        print_service_status "$i"
+        local name=$(get_svc_var "$i" "NAME")
+        local path=$(get_svc_var "$i" "PATH")
+        local user=$(get_svc_var "$i" "USER" "root")
+        local pgrep_pat=$(get_svc_var "$i" "PGREP" "$(basename "$path")")
+        local stagger=$(get_svc_var "$i" "STAGGER_HOURS" "0")
+
+        local stagger_secs=$(( stagger * 3600 ))
+        local effective_interval=$(( restart_base_secs + stagger_secs ))
+
+        echo -e "${CYAN}── ${name} ──${NC}"
+
+        local pid
+        pid=$(pgrep -u "$user" -f "$pgrep_pat" -n 2>/dev/null || echo "0")
+
+        if [[ "$pid" -gt 0 ]]; then
+            echo -e "  State:          ${GREEN}running${NC}"
+            echo "  PID:            ${pid}"
+
+            # Memory
+            local rss_kb=0
+            if [[ -f "/proc/${pid}/status" ]]; then
+                rss_kb=$(awk '/VmRSS/ {print $2}' "/proc/${pid}/status" 2>/dev/null || echo "0")
+            fi
+            local rss_mb=$(( rss_kb / 1024 ))
+            echo "  Memory (RSS):   ${rss_mb} MB (${rss_kb} KB)"
+
+            # CPU
+            local cpu
+            cpu=$(ps -o %cpu= -p "$pid" 2>/dev/null | tr -d ' ' || echo "0.0")
+            echo "  CPU:            ${cpu}%"
+
+            # Uptime from /proc
+            local proc_start
+            proc_start=$(stat -c %Y "/proc/${pid}" 2>/dev/null || echo "0")
+            if [[ "$proc_start" -gt 0 ]]; then
+                local now_ts=$(date +%s)
+                local uptime_secs=$(( now_ts - proc_start ))
+                echo "  Uptime:         $(format_duration $uptime_secs)"
+            fi
+        else
+            echo -e "  State:          ${RED}stopped${NC}"
+        fi
+
+        # Next scheduled restart
+        local lr_file="${DATA_DIR}/${name}.last_restart"
+        if [[ -f "$lr_file" ]]; then
+            local last_restart
+            last_restart=$(cat "$lr_file")
+            local now_ts=$(date +%s)
+            local elapsed=$(( now_ts - last_restart ))
+            local remaining=$(( effective_interval - elapsed ))
+            echo "  Next restart:   $(format_duration $remaining)"
+            if [[ "$stagger" -gt 0 ]]; then
+                echo "  Stagger:        +${stagger}h offset"
+            fi
+        else
+            echo "  Next restart:   pending first check"
+        fi
+
+        echo ""
     done
 
     echo -e "${CYAN}── Health Check Timer ──${NC}"
