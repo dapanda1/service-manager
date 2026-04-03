@@ -11,7 +11,7 @@ Monitors Linux programs with scheduled restarts, health checks, memory tracking,
 3. Logs memory (RSS) and CPU for each program to a CSV file for trend analysis.
 4. Sends a webhook/email notification if a program fails to start.
 
-You stay in full control. Close a program from the GUI at 2pm — the health check at 3pm brings it back. That's the intended behavior.
+You stay in full control. Close the program from the GUI at 2pm — the health check at 3pm brings it back. That's the intended behavior.
 
 ## Features
 
