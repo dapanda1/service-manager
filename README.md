@@ -1,4 +1,4 @@
-# Service Manager (v2.0.0)
+# Service Manager (v2.0.1)
 
 Monitors Linux programs with scheduled restarts, health checks, memory tracking, failure notifications, and a JSON dashboard. Designed for programs with memory leaks running on a Raspberry Pi.
 

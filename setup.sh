@@ -3,7 +3,7 @@ set -euo pipefail
 
 # ============================================================================
 # Service Manager Setup Script
-# Version: 2.0.0
+# Version: 2.0.1
 #
 # Monitor-based approach: programs are started/stopped by the user normally
 # (taskbar, icon, right-click close). A health check runs on a timer to:
@@ -17,7 +17,7 @@ set -euo pipefail
 # Systemd is only used for the health check timer, dashboard, and notify.
 # ============================================================================
 
-VERSION="2.0.0"
+VERSION="2.0.1"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 CONFIG_FILE="${SCRIPT_DIR}/services.conf"
@@ -277,6 +277,7 @@ start_program() {
     local user="${USERS[$idx]}"
     local env="${ENVS[$idx]}"
     local name="${NAMES[$idx]}"
+    local pgrep_pat="${PGREPS[$idx]}"
 
     # Build environment exports
     local env_exports=""
@@ -294,8 +295,8 @@ start_program() {
     sudo -u "$user" bash -c "${env_exports}nohup ${path}${args:+ ${args}} >/dev/null 2>&1 &"
 
     # Wait briefly and verify it started
-    sleep 3
-    if is_running "${path}" "$user"; then
+    sleep 5
+    if is_running "${pgrep_pat}" "$user"; then
         echo "${TS} ${name} started successfully."
         return 0
     else
@@ -309,13 +310,13 @@ start_program() {
 
 stop_program() {
     local idx="$1"
-    local path="${PATHS[$idx]}"
     local user="${USERS[$idx]}"
     local name="${NAMES[$idx]}"
     local pre_shutdown="${PRE_SHUTDOWNS[$idx]}"
+    local pgrep_pat="${PGREPS[$idx]}"
     local pid
 
-    pid=$(get_pid "$path" "$user")
+    pid=$(get_pid "$pgrep_pat" "$user")
     if [[ "$pid" -eq 0 ]]; then
         return 0
     fi
@@ -387,6 +388,7 @@ for idx in "${!NAMES[@]}"; do
     name="${NAMES[$idx]}"
     path="${PATHS[$idx]}"
     user="${USERS[$idx]}"
+    pgrep_pat="${PGREPS[$idx]}"
     hcmd="${HEALTH_CMDS[$idx]}"
     stagger="${STAGGERS[$idx]}"
     mem_max="${MEMORY_MAXES[$idx]}"
@@ -400,9 +402,9 @@ for idx in "${!NAMES[@]}"; do
     effective_interval=$(( RESTART_INTERVAL_SECS + stagger_secs ))
 
     running=false
-    if is_running "$path" "$user"; then
+    if is_running "$pgrep_pat" "$user"; then
         running=true
-        pid=$(get_pid "$path" "$user")
+        pid=$(get_pid "$pgrep_pat" "$user")
     fi
 
     if $running; then
@@ -432,7 +434,7 @@ for idx in "${!NAMES[@]}"; do
                 if start_program "$idx"; then
                     set_last_restart "$name" "$(date +%s)"
                     status="restarted_scheduled"
-                    pid=$(get_pid "$path" "$user")
+                    pid=$(get_pid "$pgrep_pat" "$user")
                     if [[ "$pid" -gt 0 ]] && [[ -d "/proc/${pid}" ]]; then
                         rss=$(awk '"'"'/VmRSS/ {print $2}'"'"' "/proc/${pid}/status" 2>/dev/null || echo "0")
                         cpu=$(ps -o %cpu= -p "$pid" 2>/dev/null | tr -d '"'"' '"'"' || echo "0.0")
@@ -461,7 +463,7 @@ for idx in "${!NAMES[@]}"; do
                 else
                     status="restart_failed"
                 fi
-                pid=$(get_pid "$path" "$user")
+                pid=$(get_pid "$pgrep_pat" "$user")
                 echo "${TS},${name},${pid},${rss},${cpu},${status}" >> "$MEMORY_CSV"
                 echo "${TS} ${name}: pid=${pid} rss=${rss}KB cpu=${cpu}% status=${status}"
                 continue
@@ -482,7 +484,7 @@ for idx in "${!NAMES[@]}"; do
                 else
                     status="restart_failed"
                 fi
-                pid=$(get_pid "$path" "$user")
+                pid=$(get_pid "$pgrep_pat" "$user")
                 echo "${TS},${name},${pid},${rss},${cpu},${status}" >> "$MEMORY_CSV"
                 echo "${TS} ${name}: pid=${pid} rss=${rss}KB cpu=${cpu}% status=${status}"
                 continue
@@ -506,7 +508,7 @@ for idx in "${!NAMES[@]}"; do
             if [[ "$last_restart" -eq 0 ]]; then
                 set_last_restart "$name" "$(date +%s)"
             fi
-            pid=$(get_pid "$path" "$user")
+            pid=$(get_pid "$pgrep_pat" "$user")
             status="started"
         else
             status="start_failed"
