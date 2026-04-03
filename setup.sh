@@ -666,6 +666,7 @@ PATHS = ${py_paths}
 USERS = ${py_users}
 PGREPS = ${py_pgreps}
 RESTART_BASE_SECS = ${restart_base_secs}
+RESTART_DELAY_SECS = ${RESTART_DELAY_SECS}
 STAGGER_HOURS = ${py_staggers}
 DATA_DIR = \"${DATA_DIR}\"
 MEMORY_CSV = \"${MEMORY_CSV}\"
@@ -677,10 +678,16 @@ def get_service_info(idx):
     user = USERS[idx]
     pgrep_pat = PGREPS[idx]
 
+    stagger_secs = STAGGER_HOURS.get(name, 0) * 3600
+
     info = {
         \"name\": name, \"state\": \"stopped\", \"pid\": 0,
         \"rss_kb\": 0, \"cpu_pct\": 0.0, \"uptime_secs\": 0,
-        \"restart_in_secs\": 0
+        \"restart_in_secs\": 0,
+        \"restart_interval_days\": RESTART_BASE_SECS // 86400,
+        \"restart_delay_secs\": RESTART_DELAY_SECS,
+        \"stagger_hours\": STAGGER_HOURS.get(name, 0),
+        \"effective_interval_secs\": RESTART_BASE_SECS + stagger_secs
     }
 
     try:
@@ -723,8 +730,7 @@ def get_service_info(idx):
             with open(lr_file) as f:
                 last_restart = int(f.read().strip())
             stagger_secs = STAGGER_HOURS.get(name, 0) * 3600
-            effective = RESTART_BASE_SECS + stagger_secs
-            remaining = effective - (int(time.time()) - last_restart)
+            remaining = info[\"effective_interval_secs\"] - (int(time.time()) - last_restart)
             info[\"restart_in_secs\"] = max(0, remaining)
     except Exception:
         pass
@@ -1053,6 +1059,14 @@ do_status() {
 
         echo -e "${CYAN}── ${name} ──${NC}"
 
+        local restart_days="${RESTART_INTERVAL_DAYS}"
+        local delay_mins=$(( RESTART_DELAY_SECS / 60 ))
+        echo "  Restart every:  ${restart_days} day(s)"
+        echo "  Restart delay:  ${delay_mins} min (${RESTART_DELAY_SECS}s)"
+        if [[ "$stagger" -gt 0 ]]; then
+            echo "  Stagger:        +${stagger}h offset"
+        fi
+
         local pid
         pid=$(pgrep -u "$user" -f "$pgrep_pat" -n 2>/dev/null || echo "0")
 
@@ -1094,9 +1108,6 @@ do_status() {
             local elapsed=$(( now_ts - last_restart ))
             local remaining=$(( effective_interval - elapsed ))
             echo "  Next restart:   $(format_duration $remaining)"
-            if [[ "$stagger" -gt 0 ]]; then
-                echo "  Stagger:        +${stagger}h offset"
-            fi
         else
             echo "  Next restart:   pending first check"
         fi
