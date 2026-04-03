@@ -1,4 +1,4 @@
-# Service Manager
+# Service Manager (v2.0.0)
 
 Monitors Linux programs with scheduled restarts, health checks, memory tracking, failure notifications, and a JSON dashboard. Designed for programs with memory leaks running on a Raspberry Pi.
 
@@ -128,6 +128,68 @@ echo $(date +%s) | sudo tee /var/lib/svc-manager/<name>.last_restart
 3. Run `sudo bash setup.sh --update`
 
 The new program will be picked up at the next health check.
+
+## Home Assistant Integration
+
+The dashboard and notification system can integrate with a Home Assistant instance on a separate machine. Two directions: HA pulls status from the Pi, and the Pi pushes failure alerts to HA.
+
+### REST Sensors (HA pulls from Pi)
+
+Set `DASHBOARD_PORT` to a non-zero value in `services.conf` (e.g., `8099`). Then add the following to HA's `configuration.yaml`, replacing `<pi-ip>` with the Pi's IP address and adjusting the service array indices for your setup:
+
+```yaml
+rest:
+  - resource: http://<pi-ip>:8099/status
+    scan_interval: 120
+    sensor:
+      - name: "Service 1 State"
+        value_template: "{{ value_json.services[0].state }}"
+      - name: "Service 1 Memory MB"
+        value_template: "{{ (value_json.services[0].rss_kb / 1024) | round(1) }}"
+        unit_of_measurement: "MB"
+      - name: "Service 1 CPU"
+        value_template: "{{ value_json.services[0].cpu_pct }}"
+        unit_of_measurement: "%"
+      - name: "Service 1 Restart In"
+        value_template: "{{ (value_json.services[0].restart_in_secs / 3600) | round(1) }}"
+        unit_of_measurement: "hours"
+      - name: "Service 2 State"
+        value_template: "{{ value_json.services[1].state }}"
+      - name: "Service 2 Memory MB"
+        value_template: "{{ (value_json.services[1].rss_kb / 1024) | round(1) }}"
+        unit_of_measurement: "MB"
+      - name: "Service 2 CPU"
+        value_template: "{{ value_json.services[1].cpu_pct }}"
+        unit_of_measurement: "%"
+      - name: "Service 2 Restart In"
+        value_template: "{{ (value_json.services[1].restart_in_secs / 3600) | round(1) }}"
+        unit_of_measurement: "hours"
+```
+
+This creates sensor entities in HA that update every 2 minutes. Use them in dashboard cards, history graphs, or automations (e.g., notify if state != "running").
+
+Additional fields available per service: `restart_interval_days`, `restart_delay_secs`, `stagger_hours`, `effective_interval_secs`, `uptime_secs`, `pid`.
+
+### Failure Notifications (Pi pushes to HA)
+
+Create a webhook automation in HA:
+
+1. In HA, go to **Settings → Automations → Create Automation**
+2. Trigger type: **Webhook**
+3. Set a webhook ID (e.g., `svc-manager-failure`)
+4. Action: send a push notification, turn on a light, whatever you want
+
+Then set `NOTIFY_WEBHOOK_URL` in `services.conf` on the Pi:
+
+```
+NOTIFY_WEBHOOK_URL="http://<ha-ip>:8123/api/webhook/svc-manager-failure"
+```
+
+Run `sudo bash setup.sh --update`. The Pi will POST to that URL whenever a program fails to start after a health check.
+
+### Memory History
+
+The `/memory` endpoint returns the last 100 rows of the memory trend CSV as JSON. This can be used with HA's REST sensor or polled by an external tool to build long-term memory graphs.
 
 ## Notes
 

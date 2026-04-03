@@ -2,7 +2,8 @@
 set -euo pipefail
 
 # ============================================================================
-# Service Manager Setup Script (v2)
+# Service Manager Setup Script
+# Version: 2.0.0
 #
 # Monitor-based approach: programs are started/stopped by the user normally
 # (taskbar, icon, right-click close). A health check runs on a timer to:
@@ -15,6 +16,8 @@ set -euo pipefail
 # No systemd .service units are created for the managed programs.
 # Systemd is only used for the health check timer, dashboard, and notify.
 # ============================================================================
+
+VERSION="2.0.0"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 CONFIG_FILE="${SCRIPT_DIR}/services.conf"
@@ -42,6 +45,8 @@ log_dry()   { echo -e "${CYAN}[DRY]${NC}  $1"; }
 
 usage() {
     cat << EOF
+Service Manager v${VERSION}
+
 Usage: $0 [OPTION]
 
 Options:
@@ -661,6 +666,7 @@ import time
 from datetime import datetime
 
 PORT = ${port}
+VERSION = \"${VERSION}\"
 SERVICES = ${py_names}
 PATHS = ${py_paths}
 USERS = ${py_users}
@@ -763,6 +769,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path in (\"/\", \"/status\"):
             data = {
+                \"version\": VERSION,
                 \"timestamp\": datetime.now().isoformat(),
                 \"services\": [get_service_info(i) for i in range(len(SERVICES))],
             }
@@ -887,7 +894,7 @@ do_install() {
     fi
 
     echo ""
-    log_info "Installation complete."
+    log_info "Installation complete. (v${VERSION})"
     echo ""
     local svc_list=""
     for i in $(seq 1 "$SERVICE_COUNT"); do
@@ -1046,6 +1053,8 @@ do_status() {
 
     local restart_base_secs=$(( RESTART_INTERVAL_DAYS * 86400 ))
 
+    echo ""
+    echo -e "${CYAN}Service Manager v${VERSION}${NC}"
     echo ""
     for i in $(seq 1 "$SERVICE_COUNT"); do
         local name=$(get_svc_var "$i" "NAME")
