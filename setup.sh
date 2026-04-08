@@ -3,7 +3,7 @@ set -euo pipefail
 
 # ============================================================================
 # Service Manager Setup Script
-# Version: 2.0.1
+# Version: 2.0.2
 #
 # Monitor-based approach: programs are started/stopped by the user normally
 # (taskbar, icon, right-click close). A health check runs on a timer to:
@@ -17,7 +17,7 @@ set -euo pipefail
 # Systemd is only used for the health check timer, dashboard, and notify.
 # ============================================================================
 
-VERSION="2.0.1"
+VERSION="2.0.2"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 CONFIG_FILE="${SCRIPT_DIR}/services.conf"
@@ -532,6 +532,7 @@ Description=Health check for managed programs
 
 [Service]
 Type=oneshot
+KillMode=process
 ExecStart=${BIN_DIR}/svc-manager-health-check.sh"
 
     local timer_content="[Unit]
