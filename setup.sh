@@ -3,7 +3,7 @@ set -euo pipefail
 
 # ============================================================================
 # Service Manager Setup Script
-# Version: 2.0.2
+# Version: 2.0.3
 #
 # Monitor-based approach: programs are started/stopped by the user normally
 # (taskbar, icon, right-click close). A health check runs on a timer to:
@@ -17,7 +17,8 @@ set -euo pipefail
 # Systemd is only used for the health check timer, dashboard, and notify.
 # ============================================================================
 
-VERSION="2.0.2"
+VERSION="2.0.3"
+REPO_URL="https://github.com/dapanda1/service-manager.git"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 CONFIG_FILE="${SCRIPT_DIR}/services.conf"
@@ -53,6 +54,7 @@ Options:
   --install       Install and enable health check, dashboard, notifications
   --uninstall     Stop, disable, and remove all generated files
   --update        Regenerate files, restart only components that changed
+  --upgrade       Pull latest version from GitHub, preserve config, run update
   --status        Show program status, memory, CPU, restart countdown
   --dry-run       Show what --install would do without making changes
   --verbose       With --dry-run, print generated file contents
@@ -203,7 +205,6 @@ generate_health_check_script() {
     local script_path="${BIN_DIR}/svc-manager-health-check.sh"
     local restart_interval_secs=$(( RESTART_INTERVAL_DAYS * 86400 ))
 
-    # Build config arrays for the health check script
     local names_arr="" paths_arr="" args_arr="" users_arr=""
     local env_arr="" pgrep_arr="" health_cmds_arr=""
     local pre_shutdown_arr="" stagger_arr="" memory_max_arr=""
@@ -638,7 +639,6 @@ generate_dashboard() {
 
     local restart_base_secs=$(( RESTART_INTERVAL_DAYS * 86400 ))
 
-    # Build Python lists/dicts from config
     local py_names="[" py_paths="[" py_users="[" py_pgreps="[" py_staggers="{"
     for i in $(seq 1 "$SERVICE_COUNT"); do
         local name=$(get_svc_var "$i" "NAME")
@@ -686,7 +686,6 @@ def get_service_info(idx):
     path = PATHS[idx]
     user = USERS[idx]
     pgrep_pat = PGREPS[idx]
-
     stagger_secs = STAGGER_HOURS.get(name, 0) * 3600
 
     info = {
@@ -738,7 +737,6 @@ def get_service_info(idx):
         if os.path.isfile(lr_file):
             with open(lr_file) as f:
                 last_restart = int(f.read().strip())
-            stagger_secs = STAGGER_HOURS.get(name, 0) * 3600
             remaining = info[\"effective_interval_secs\"] - (int(time.time()) - last_restart)
             info[\"restart_in_secs\"] = max(0, remaining)
     except Exception:
@@ -839,6 +837,89 @@ backup_config() {
     ts=$(date '+%Y%m%d_%H%M%S')
     cp "$CONFIG_FILE" "${dest}/services.conf.${ts}"
     log_info "Config backed up to ${dest}/services.conf.${ts}"
+}
+
+# ---------- Upgrade ----------
+
+do_upgrade() {
+    if [[ "$(id -u)" -ne 0 ]]; then
+        log_error "Upgrade requires root. Run with sudo."
+        exit 1
+    fi
+
+    if ! command -v git >/dev/null 2>&1; then
+        log_error "git is not installed."
+        exit 1
+    fi
+
+    log_info "Current version: v${VERSION}"
+
+    # Preserve config
+    if [[ -f "$CONFIG_FILE" ]]; then
+        log_info "Backing up services.conf..."
+        cp "$CONFIG_FILE" /tmp/svc-manager-services.conf.bak
+    else
+        log_error "No services.conf found. Nothing to preserve."
+        exit 1
+    fi
+
+    # Clone fresh copy
+    local tmp_dir
+    tmp_dir=$(mktemp -d /tmp/svc-manager-upgrade.XXXXXX)
+
+    log_info "Cloning latest from ${REPO_URL}..."
+    if ! git clone --depth 1 "$REPO_URL" "$tmp_dir" 2>/dev/null; then
+        log_error "Failed to clone repository."
+        rm -rf "$tmp_dir"
+        exit 1
+    fi
+
+    # Verify the clone has setup.sh
+    if [[ ! -f "${tmp_dir}/setup.sh" ]]; then
+        log_error "Cloned repo does not contain setup.sh."
+        rm -rf "$tmp_dir"
+        exit 1
+    fi
+
+    # Get new version
+    local new_version
+    new_version=$(grep '^VERSION=' "${tmp_dir}/setup.sh" | head -1 | cut -d'"' -f2)
+    log_info "Latest version:  v${new_version:-unknown}"
+
+    if [[ "${new_version}" == "${VERSION}" ]]; then
+        log_info "Already on the latest version."
+        rm -rf "$tmp_dir"
+        # Restore config and run update anyway in case files are out of sync
+        cp /tmp/svc-manager-services.conf.bak "$CONFIG_FILE"
+        exec bash "$0" --update
+        return
+    fi
+
+    # Replace script files (not services.conf)
+    log_info "Replacing files in ${SCRIPT_DIR}..."
+    for f in setup.sh services.conf.example README.md .gitignore; do
+        if [[ -f "${tmp_dir}/${f}" ]]; then
+            cp "${tmp_dir}/${f}" "${SCRIPT_DIR}/${f}"
+            log_info "Updated ${f}"
+        fi
+    done
+
+    # Make setup.sh executable
+    chmod +x "${SCRIPT_DIR}/setup.sh"
+
+    # Restore config
+    cp /tmp/svc-manager-services.conf.bak "${SCRIPT_DIR}/services.conf"
+    log_info "Restored services.conf"
+
+    # Cleanup
+    rm -rf "$tmp_dir"
+    rm -f /tmp/svc-manager-services.conf.bak
+
+    log_info "Upgraded to v${new_version}. Running update..."
+    echo ""
+
+    # Re-exec the new setup.sh with --update
+    exec bash "${SCRIPT_DIR}/setup.sh" --update
 }
 
 # ---------- Install ----------
@@ -966,6 +1047,13 @@ do_update() {
         log_info "Health check timer unchanged."
     fi
 
+    # Always restart the health check service unit if it changed
+    local hcs_old="${SAVED_CHECKSUMS[health-check-service]:-}"
+    local hcs_new="${NEW_CHECKSUMS[health-check-service]:-}"
+    if [[ "$hcs_old" != "$hcs_new" ]]; then
+        log_info "Health check service unit changed."
+    fi
+
     # Restart dashboard if changed
     if [[ "${DASHBOARD_PORT:-0}" -gt 0 ]]; then
         local db_old="${SAVED_CHECKSUMS[dashboard]:-}"
@@ -980,7 +1068,8 @@ do_update() {
     fi
 
     echo ""
-    log_info "Update complete. Programs were not restarted."
+    log_info "Update complete. (v${VERSION})"
+    log_info "Programs were not restarted."
     log_info "Changes take effect at the next health check."
 }
 
@@ -1086,7 +1175,6 @@ do_status() {
             echo -e "  State:          ${GREEN}running${NC}"
             echo "  PID:            ${pid}"
 
-            # Memory
             local rss_kb=0
             if [[ -f "/proc/${pid}/status" ]]; then
                 rss_kb=$(awk '/VmRSS/ {print $2}' "/proc/${pid}/status" 2>/dev/null || echo "0")
@@ -1094,12 +1182,10 @@ do_status() {
             local rss_mb=$(( rss_kb / 1024 ))
             echo "  Memory (RSS):   ${rss_mb} MB (${rss_kb} KB)"
 
-            # CPU
             local cpu
             cpu=$(ps -o %cpu= -p "$pid" 2>/dev/null | tr -d ' ' || echo "0.0")
             echo "  CPU:            ${cpu}%"
 
-            # Uptime from /proc
             local proc_start
             proc_start=$(stat -c %Y "/proc/${pid}" 2>/dev/null || echo "0")
             if [[ "$proc_start" -gt 0 ]]; then
@@ -1111,7 +1197,6 @@ do_status() {
             echo -e "  State:          ${RED}stopped${NC}"
         fi
 
-        # Next scheduled restart
         local lr_file="${DATA_DIR}/${name}.last_restart"
         if [[ -f "$lr_file" ]]; then
             local last_restart
@@ -1167,6 +1252,7 @@ main() {
             --install)   action="install" ;;
             --uninstall) action="uninstall" ;;
             --update)    action="update" ;;
+            --upgrade)   action="upgrade" ;;
             --status)    action="status" ;;
             --dry-run)   DRY_RUN=true; action="${action:-install}" ;;
             --verbose)   VERBOSE=true ;;
@@ -1185,6 +1271,7 @@ main() {
         install)   do_install ;;
         uninstall) do_uninstall ;;
         update)    do_update ;;
+        upgrade)   do_upgrade ;;
         status)    do_status ;;
     esac
 }

@@ -1,4 +1,4 @@
-# Service Manager (v2.0.2)
+# Service Manager (v2.0.3)
 
 Monitors Linux programs with scheduled restarts, health checks, memory tracking, failure notifications, and a JSON dashboard. Designed for programs with memory leaks running on a Raspberry Pi.
 
@@ -27,6 +27,7 @@ You stay in full control. Close a program from the GUI at 2pm — the health che
 - **Pre-shutdown commands** — optional cleanup command before SIGTERM
 - **Dry run mode** — preview all generated files without touching the system
 - **Update mode** — regenerate files with checksum diffing, no program restarts
+- **Upgrade mode** — pull latest version from GitHub, preserve config, run update
 - **Config backup** — automatic timestamped copy of services.conf on install/update
 - **JSON dashboard** — lightweight HTTP endpoint serving live status and memory history
 - **GUI compatible** — works with programs running in X11/VNC desktop sessions
@@ -35,7 +36,7 @@ You stay in full control. Close a program from the GUI at 2pm — the health che
 
 ```bash
 # Clone and configure
-git clone <your-repo-url>
+git clone https://github.com/dapanda1/service-manager.git
 cd service-manager
 cp services.conf.example services.conf
 nano services.conf
@@ -53,10 +54,29 @@ sudo bash setup.sh --install
 |---------|-------------|
 | `sudo bash setup.sh --install` | Generate all files, enable health check timer and dashboard |
 | `sudo bash setup.sh --uninstall` | Remove all generated files (running programs are not touched) |
-| `sudo bash setup.sh --update` | Regenerate files, restart only components that changed |
+| `sudo bash setup.sh --update` | Regenerate files from current config, restart only changed components |
+| `sudo bash setup.sh --upgrade` | Pull latest from GitHub, preserve config, run update automatically |
 | `bash setup.sh --status` | Show state, PID, memory, CPU, uptime, restart countdown |
 | `sudo bash setup.sh --dry-run` | Preview install without making changes |
 | `sudo bash setup.sh --dry-run --verbose` | Same, but print generated file contents |
+
+## Upgrading
+
+To pull the latest version and apply it in one step:
+
+```bash
+cd ~/Downloads/service-manager   # or wherever your repo lives
+sudo bash setup.sh --upgrade
+```
+
+This will:
+1. Back up your `services.conf`
+2. Clone the latest version from GitHub
+3. Replace all script files (not your config)
+4. Restore `services.conf`
+5. Run `--update` with the new code
+
+No manual backup/clone/restore needed.
 
 ## Config Reference
 
@@ -88,7 +108,7 @@ See `services.conf.example` for all fields with descriptions.
 | Dashboard unit | `/etc/systemd/system/svc-manager-dashboard.service` |
 | Logrotate configs | `/etc/logrotate.d/svc-manager-*` |
 | Memory CSV | `/var/log/svc-manager/memory.csv` |
-| Restart timestamps | `/var/lib/svc-manager/<name>.last_restart` |
+| Restart timestamps | `/var/lib/svc-manager/<n>.last_restart` |
 | Checksums | `/var/lib/svc-manager/checksums` |
 
 No systemd service units are created for the managed programs.
@@ -101,33 +121,6 @@ Set `DASHBOARD_PORT` to a non-zero value. Endpoints:
 - `GET /memory` — last 100 rows from the memory trend CSV
 
 CORS enabled. Can be consumed by Home Assistant REST sensors or any HTTP client.
-
-## Useful Commands
-
-```bash
-# View last health check output
-journalctl -u svc-manager-health-check.service --since "2 hours ago"
-
-# Manually trigger a health check now
-sudo systemctl start svc-manager-health-check.service
-
-# Check timer schedule
-systemctl list-timers svc-manager-health-check.timer
-
-# View memory trend
-column -t -s',' /var/log/svc-manager/memory.csv | tail -20
-
-# Reset a program's restart timer (delays next scheduled restart)
-echo $(date +%s) | sudo tee /var/lib/svc-manager/<name>.last_restart
-```
-
-## Adding a Program
-
-1. Increment `SERVICE_COUNT` in `services.conf`
-2. Add the `SERVICE_N_*` block
-3. Run `sudo bash setup.sh --update`
-
-The new program will be picked up at the next health check.
 
 ## Home Assistant Integration
 
@@ -143,25 +136,33 @@ rest:
     scan_interval: 120
     sensor:
       - name: "Service 1 State"
+        unique_id: svc_mgr_service1_state
         value_template: "{{ value_json.services[0].state }}"
       - name: "Service 1 Memory MB"
+        unique_id: svc_mgr_service1_memory
         value_template: "{{ (value_json.services[0].rss_kb / 1024) | round(1) }}"
         unit_of_measurement: "MB"
       - name: "Service 1 CPU"
+        unique_id: svc_mgr_service1_cpu
         value_template: "{{ value_json.services[0].cpu_pct }}"
         unit_of_measurement: "%"
       - name: "Service 1 Restart In"
+        unique_id: svc_mgr_service1_restart
         value_template: "{{ (value_json.services[0].restart_in_secs / 3600) | round(1) }}"
         unit_of_measurement: "hours"
       - name: "Service 2 State"
+        unique_id: svc_mgr_service2_state
         value_template: "{{ value_json.services[1].state }}"
       - name: "Service 2 Memory MB"
+        unique_id: svc_mgr_service2_memory
         value_template: "{{ (value_json.services[1].rss_kb / 1024) | round(1) }}"
         unit_of_measurement: "MB"
       - name: "Service 2 CPU"
+        unique_id: svc_mgr_service2_cpu
         value_template: "{{ value_json.services[1].cpu_pct }}"
         unit_of_measurement: "%"
       - name: "Service 2 Restart In"
+        unique_id: svc_mgr_service2_restart
         value_template: "{{ (value_json.services[1].restart_in_secs / 3600) | round(1) }}"
         unit_of_measurement: "hours"
 ```
@@ -169,6 +170,8 @@ rest:
 This creates sensor entities in HA that update every 2 minutes. Use them in dashboard cards, history graphs, or automations (e.g., notify if state != "running").
 
 Additional fields available per service: `restart_interval_days`, `restart_delay_secs`, `stagger_hours`, `effective_interval_secs`, `uptime_secs`, `pid`.
+
+Requires a full Home Assistant restart after adding (not just a YAML reload).
 
 ### Failure Notifications (Pi pushes to HA)
 
@@ -191,11 +194,38 @@ Run `sudo bash setup.sh --update`. The Pi will POST to that URL whenever a progr
 
 The `/memory` endpoint returns the last 100 rows of the memory trend CSV as JSON. This can be used with HA's REST sensor or polled by an external tool to build long-term memory graphs.
 
+## Useful Commands
+
+```bash
+# View last health check output
+journalctl -u svc-manager-health-check.service --since "2 hours ago"
+
+# Manually trigger a health check now
+sudo systemctl start svc-manager-health-check.service
+
+# Check timer schedule
+systemctl list-timers svc-manager-health-check.timer
+
+# View memory trend
+column -t -s',' /var/log/svc-manager/memory.csv | tail -20
+
+# Reset a program's restart timer (delays next scheduled restart)
+echo $(date +%s) | sudo tee /var/lib/svc-manager/<n>.last_restart
+```
+
+## Adding a Program
+
+1. Increment `SERVICE_COUNT` in `services.conf`
+2. Add the `SERVICE_N_*` block
+3. Run `sudo bash setup.sh --update`
+
+The new program will be picked up at the next health check.
+
 ## Notes
 
 - **Back up `services.conf` separately.** It is gitignored. Use `CONFIG_BACKUP_DIR` for automatic copies.
 - **SD card wear.** If a program does heavy writes, point its working directory to a USB drive or tmpfs.
-- **Restart timer** counts from the last restart timestamp in `/var/lib/svc-manager/<name>.last_restart`. Manually closing and reopening a program does NOT reset this timer — only a scheduled restart or a health-check-triggered restart does.
+- **Restart timer** counts from the last restart timestamp in `/var/lib/svc-manager/<n>.last_restart`. Manually closing and reopening a program does NOT reset this timer — only a scheduled restart or a health-check-triggered restart does.
 - **Manually closed programs** come back at the next health check (within 2 hours by default). This is intentional.
 - **The 5-minute delay** only applies to scheduled restarts (memory leak cycle). If a program is found down during a regular health check, it is restarted immediately.
 - **PGREP pattern** defaults to the basename of PATH. Override it if the running process name differs from the binary name (e.g., Java apps where the process shows as `java` not `myapp`).
