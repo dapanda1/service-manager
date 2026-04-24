@@ -46,6 +46,10 @@ SERVICE_1_HEALTH_CMD=""
 # Staggers restarts so they don't all happen at the same time.
 SERVICE_1_STAGGER_HOURS="0"
 
+# Optional: set to "true" to only monitor resources without starting/stopping.
+# The program will be tracked for memory and CPU but never started or restarted.
+SERVICE_1_WATCH_ONLY="false"
+
 # ---------- Service 2 ----------
 SERVICE_2_NAME="myapp2"
 SERVICE_2_PATH="/usr/bin/myapp2"
@@ -58,6 +62,7 @@ SERVICE_2_LOG_FILE=""
 SERVICE_2_MEMORY_MAX=""
 SERVICE_2_HEALTH_CMD=""
 SERVICE_2_STAGGER_HOURS="24"
+SERVICE_2_WATCH_ONLY="false"
 
 # ---------- Timing ----------
 # Base restart interval in days. Each program may add STAGGER_HOURS on top.

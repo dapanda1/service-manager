@@ -1,4 +1,4 @@
-# Service Manager (v2.0.3)
+# Service Manager (v2.0.4)
 
 Monitors Linux programs with scheduled restarts, health checks, memory tracking, failure notifications, and a JSON dashboard. Designed for programs with memory leaks running on a Raspberry Pi.
 
@@ -95,6 +95,7 @@ See `services.conf.example` for all fields with descriptions.
 | `SERVICE_N_MEMORY_MAX` | No | Memory cap — restart if exceeded (e.g., "512M") |
 | `SERVICE_N_HEALTH_CMD` | No | Health check command (exit 0 = healthy) |
 | `SERVICE_N_STAGGER_HOURS` | No | Hours offset from base restart cycle |
+| `SERVICE_N_WATCH_ONLY` | No | "true" to only monitor, never start/stop/restart |
 
 ## Generated Files
 

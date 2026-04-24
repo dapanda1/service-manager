@@ -3,7 +3,7 @@ set -euo pipefail
 
 # ============================================================================
 # Service Manager Setup Script
-# Version: 2.0.3
+# Version: 2.0.4
 #
 # Monitor-based approach: programs are started/stopped by the user normally
 # (taskbar, icon, right-click close). A health check runs on a timer to:
@@ -17,7 +17,7 @@ set -euo pipefail
 # Systemd is only used for the health check timer, dashboard, and notify.
 # ============================================================================
 
-VERSION="2.0.3"
+VERSION="2.0.4"
 REPO_URL="https://github.com/dapanda1/service-manager.git"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -208,6 +208,7 @@ generate_health_check_script() {
     local names_arr="" paths_arr="" args_arr="" users_arr=""
     local env_arr="" pgrep_arr="" health_cmds_arr=""
     local pre_shutdown_arr="" stagger_arr="" memory_max_arr=""
+    local watch_only_arr=""
 
     for i in $(seq 1 "$count"); do
         names_arr+="\"$(get_svc_var "$i" "NAME")\" "
@@ -220,6 +221,7 @@ generate_health_check_script() {
         pre_shutdown_arr+="\"$(get_svc_var "$i" "PRE_SHUTDOWN")\" "
         stagger_arr+="\"$(get_svc_var "$i" "STAGGER_HOURS" "0")\" "
         memory_max_arr+="\"$(get_svc_var "$i" "MEMORY_MAX")\" "
+        watch_only_arr+="\"$(get_svc_var "$i" "WATCH_ONLY" "false")\" "
     done
 
     local content='#!/bin/bash
@@ -243,6 +245,7 @@ HEALTH_CMDS=('"${health_cmds_arr}"')
 PRE_SHUTDOWNS=('"${pre_shutdown_arr}"')
 STAGGERS=('"${stagger_arr}"')
 MEMORY_MAXES=('"${memory_max_arr}"')
+WATCH_ONLYS=('"${watch_only_arr}"')
 
 exec 200>"$LOCK_FILE"
 if ! flock -n 200; then
@@ -393,6 +396,7 @@ for idx in "${!NAMES[@]}"; do
     hcmd="${HEALTH_CMDS[$idx]}"
     stagger="${STAGGERS[$idx]}"
     mem_max="${MEMORY_MAXES[$idx]}"
+    watch_only="${WATCH_ONLYS[$idx]}"
 
     pid="0"
     rss="0"
@@ -416,6 +420,21 @@ for idx in "${!NAMES[@]}"; do
         fi
 
         status="running"
+
+        # Watch-only mode: collect metrics, skip all restart logic
+        if [[ "$watch_only" == "true" ]]; then
+            cpu_int=${cpu%%.*}
+            if [[ "${cpu_int:-0}" -ge "$CPU_THRESHOLD" ]]; then
+                echo "${TS} ${name} CPU at ${cpu}% (threshold: ${CPU_THRESHOLD}%)."
+                status="high_cpu"
+                logger -t svc-manager "${name} CPU at ${cpu}% exceeds threshold ${CPU_THRESHOLD}%"
+            else
+                status="watching"
+            fi
+            echo "${TS},${name},${pid},${rss},${cpu},${status}" >> "$MEMORY_CSV"
+            echo "${TS} ${name}: pid=${pid} rss=${rss}KB cpu=${cpu}% status=${status}"
+            continue
+        fi
 
         # Check if scheduled restart is due
         last_restart=$(get_last_restart "$name")
@@ -501,18 +520,23 @@ for idx in "${!NAMES[@]}"; do
         fi
 
     else
-        # Not running — start it
-        echo "${TS} ${name} is not running."
-        if start_program "$idx"; then
-            # Only reset the restart timer if there was no previous baseline
-            last_restart=$(get_last_restart "$name")
-            if [[ "$last_restart" -eq 0 ]]; then
-                set_last_restart "$name" "$(date +%s)"
-            fi
-            pid=$(get_pid "$pgrep_pat" "$user")
-            status="started"
+        # Not running
+        if [[ "$watch_only" == "true" ]]; then
+            status="stopped"
+            echo "${TS} ${name}: not running (watch-only)."
         else
-            status="start_failed"
+            echo "${TS} ${name} is not running."
+            if start_program "$idx"; then
+                # Only reset the restart timer if there was no previous baseline
+                last_restart=$(get_last_restart "$name")
+                if [[ "$last_restart" -eq 0 ]]; then
+                    set_last_restart "$name" "$(date +%s)"
+                fi
+                pid=$(get_pid "$pgrep_pat" "$user")
+                status="started"
+            else
+                status="start_failed"
+            fi
         fi
     fi
 
@@ -639,24 +663,30 @@ generate_dashboard() {
 
     local restart_base_secs=$(( RESTART_INTERVAL_DAYS * 86400 ))
 
-    local py_names="[" py_paths="[" py_users="[" py_pgreps="[" py_staggers="{"
+    local py_names="[" py_paths="[" py_users="[" py_pgreps="[" py_staggers="{" py_watch_only="{"
     for i in $(seq 1 "$SERVICE_COUNT"); do
         local name=$(get_svc_var "$i" "NAME")
         local path=$(get_svc_var "$i" "PATH")
         local user=$(get_svc_var "$i" "USER" "root")
         local pgrep_pat=$(get_svc_var "$i" "PGREP" "$(basename "$path")")
         local stagger=$(get_svc_var "$i" "STAGGER_HOURS" "0")
+        local wo=$(get_svc_var "$i" "WATCH_ONLY" "false")
         if [[ "$i" -gt 1 ]]; then
             py_names+=", "; py_paths+=", "; py_users+=", "; py_pgreps+=", "
-            py_staggers+=", "
+            py_staggers+=", "; py_watch_only+=", "
         fi
         py_names+="\"${name}\""
         py_paths+="\"${path}\""
         py_users+="\"${user}\""
         py_pgreps+="\"${pgrep_pat}\""
         py_staggers+="\"${name}\": ${stagger}"
+        if [[ "$wo" == "true" ]]; then
+            py_watch_only+="\"${name}\": True"
+        else
+            py_watch_only+="\"${name}\": False"
+        fi
     done
-    py_names+="]"; py_paths+="]"; py_users+="]"; py_pgreps+="]"; py_staggers+="}"
+    py_names+="]"; py_paths+="]"; py_users+="]"; py_pgreps+="]"; py_staggers+="}"; py_watch_only+="}"
 
     local py_content="#!/usr/bin/env python3
 \"\"\"Lightweight JSON status dashboard for svc-manager.\"\"\"
@@ -677,6 +707,7 @@ PGREPS = ${py_pgreps}
 RESTART_BASE_SECS = ${restart_base_secs}
 RESTART_DELAY_SECS = ${RESTART_DELAY_SECS}
 STAGGER_HOURS = ${py_staggers}
+WATCH_ONLY = ${py_watch_only}
 DATA_DIR = \"${DATA_DIR}\"
 MEMORY_CSV = \"${MEMORY_CSV}\"
 
@@ -695,7 +726,8 @@ def get_service_info(idx):
         \"restart_interval_days\": RESTART_BASE_SECS // 86400,
         \"restart_delay_secs\": RESTART_DELAY_SECS,
         \"stagger_hours\": STAGGER_HOURS.get(name, 0),
-        \"effective_interval_secs\": RESTART_BASE_SECS + stagger_secs
+        \"effective_interval_secs\": RESTART_BASE_SECS + stagger_secs,
+        \"watch_only\": WATCH_ONLY.get(name, False)
     }
 
     try:
@@ -1154,18 +1186,23 @@ do_status() {
         local user=$(get_svc_var "$i" "USER" "root")
         local pgrep_pat=$(get_svc_var "$i" "PGREP" "$(basename "$path")")
         local stagger=$(get_svc_var "$i" "STAGGER_HOURS" "0")
+        local watch_only=$(get_svc_var "$i" "WATCH_ONLY" "false")
 
         local stagger_secs=$(( stagger * 3600 ))
         local effective_interval=$(( restart_base_secs + stagger_secs ))
 
         echo -e "${CYAN}── ${name} ──${NC}"
 
-        local restart_days="${RESTART_INTERVAL_DAYS}"
-        local delay_mins=$(( RESTART_DELAY_SECS / 60 ))
-        echo "  Restart every:  ${restart_days} day(s)"
-        echo "  Restart delay:  ${delay_mins} min (${RESTART_DELAY_SECS}s)"
-        if [[ "$stagger" -gt 0 ]]; then
-            echo "  Stagger:        +${stagger}h offset"
+        if [[ "$watch_only" == "true" ]]; then
+            echo -e "  Mode:           ${YELLOW}watch only${NC}"
+        else
+            local restart_days="${RESTART_INTERVAL_DAYS}"
+            local delay_mins=$(( RESTART_DELAY_SECS / 60 ))
+            echo "  Restart every:  ${restart_days} day(s)"
+            echo "  Restart delay:  ${delay_mins} min (${RESTART_DELAY_SECS}s)"
+            if [[ "$stagger" -gt 0 ]]; then
+                echo "  Stagger:        +${stagger}h offset"
+            fi
         fi
 
         local pid
@@ -1197,16 +1234,18 @@ do_status() {
             echo -e "  State:          ${RED}stopped${NC}"
         fi
 
-        local lr_file="${DATA_DIR}/${name}.last_restart"
-        if [[ -f "$lr_file" ]]; then
-            local last_restart
-            last_restart=$(cat "$lr_file")
-            local now_ts=$(date +%s)
-            local elapsed=$(( now_ts - last_restart ))
-            local remaining=$(( effective_interval - elapsed ))
-            echo "  Next restart:   $(format_duration $remaining)"
-        else
-            echo "  Next restart:   pending first check"
+        if [[ "$watch_only" != "true" ]]; then
+            local lr_file="${DATA_DIR}/${name}.last_restart"
+            if [[ -f "$lr_file" ]]; then
+                local last_restart
+                last_restart=$(cat "$lr_file")
+                local now_ts=$(date +%s)
+                local elapsed=$(( now_ts - last_restart ))
+                local remaining=$(( effective_interval - elapsed ))
+                echo "  Next restart:   $(format_duration $remaining)"
+            else
+                echo "  Next restart:   pending first check"
+            fi
         fi
 
         echo ""
